@@ -7,14 +7,20 @@ const { initCronJobs } = require('./src/services/cronService');
 
 const app = express();
 
+const rawOrigins = (process.env.FRONTEND_URL || '')
+  .split(',')
+  .map(o => o.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+
 const allowedOrigins = [
-  process.env.FRONTEND_URL,
+  ...rawOrigins,
   'http://localhost:5173',
-].filter(Boolean);
+  'http://localhost:3000',
+];
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (!origin || allowedOrigins.includes(origin) || (typeof origin === 'string' && origin.endsWith('.onrender.com'))) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
