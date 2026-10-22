@@ -25,9 +25,29 @@ app.use(cors({
 app.use(express.json());
 
 // Database connection
-mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('Connected to MongoDB'))
-  .catch(err => console.error('MongoDB connection error:', err));
+mongoose.set('bufferCommands', false);
+
+const connectMongoDB = async () => {
+  if (mongoose.connection.readyState === 1) return;
+  try {
+    require('dotenv').config({ override: true });
+    if (!process.env.MONGODB_URI) return;
+    await mongoose.connect(process.env.MONGODB_URI, { serverSelectionTimeoutMS: 4000 });
+    console.log('✅ Connected to MongoDB Atlas! All data is now persistently stored in MongoDB.');
+  } catch (err) {
+    console.warn(`[Notice] MongoDB Atlas connection failed (${err.message}).`);
+    console.log('💡 To store all data permanently in MongoDB Atlas, update your Database Access credentials in backend/.env');
+  }
+};
+
+connectMongoDB();
+
+// Periodically check and auto-connect as soon as valid credentials are saved in .env
+setInterval(() => {
+  if (mongoose.connection.readyState !== 1) {
+    connectMongoDB();
+  }
+}, 15000);
 
 // Basic route
 app.get('/', (req, res) => {

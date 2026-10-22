@@ -1,26 +1,46 @@
+const mongoose = require('mongoose');
 const Medicine = require('../models/Medicine');
 const User = require('../models/User');
+const Notification = require('../models/Notification');
+const dbStore = require('../services/dbStore');
 const { sendMedicineAddedEmail } = require('../services/emailService');
+
+const isDbReady = () => mongoose.connection.readyState === 1;
 
 // Get medicines (Parent gets own, Mentee gets parent's)
 const getMedicines = async (req, res) => {
   try {
     const clerkId = req.auth.userId;
-    const user = await User.findOne({ clerkId });
-    if (!user) return res.status(404).json({ message: 'User not found' });
 
+    if (isDbReady()) {
+      try {
+        let user = await User.findOne({ clerkId });
+        if (user) {
+          let targetId = user._id;
+          if (req.query.type === 'linked' || user.role === 'Mentee') {
+            if (!user.linkedParentId) return res.json([]);
+            targetId = user.linkedParentId;
+          }
+          const medicines = await Medicine.find({ parentId: targetId, status: 'Active' })
+            .populate('parentId', 'name')
+            .sort({ createdAt: -1 });
+          return res.json(medicines);
+        }
+      } catch (err) {
+        console.warn('MongoDB query failed in getMedicines, using memory fallback:', err.message);
+      }
+    }
+
+    // In-memory fallback
+    let user = dbStore.findUserByClerkId(clerkId) || dbStore.upsertUser(clerkId, { role: 'Parent' });
     let targetId = user._id;
-
-    if (req.query.type === 'linked') {
-      if (!user.linkedParentId) return res.json([]);
-      targetId = user.linkedParentId;
-    } else if (user.role === 'Mentee') {
+    if (req.query.type === 'linked' || user.role === 'Mentee') {
       if (!user.linkedParentId) return res.json([]);
       targetId = user.linkedParentId;
     }
 
-    const medicines = await Medicine.find({ parentId: targetId, status: 'Active' }).sort({ createdAt: -1 });
-    res.json(medicines);
+    const meds = dbStore.findMedicinesByParentId(targetId);
+    res.json(meds);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -30,26 +50,49 @@ const getMedicines = async (req, res) => {
 const addMedicine = async (req, res) => {
   try {
     const clerkId = req.auth.userId;
-    const user = await User.findOne({ clerkId });
-    if (!user) return res.status(404).json({ message: 'User not found' });
 
+    if (isDbReady()) {
+      try {
+        let user = await User.findOne({ clerkId });
+        if (!user) {
+          user = new User({ clerkId, role: 'Parent', name: 'User', email: 'user@example.com' });
+          await user.save();
+        }
+
+        let parentId = user._id;
+        if (user.role === 'Mentee' || user.role === 'caretaker' || user.role === 'Caregiver') {
+          if (!user.linkedParentId) return res.status(400).json({ message: 'Not linked to a patient. Please enter patient invite code first.' });
+          parentId = user.linkedParentId;
+        }
+
+        const newMedicine = new Medicine({
+          ...req.body,
+          createdBy: user._id,
+          parentId
+        });
+
+        await newMedicine.save();
+        sendMedicineAddedEmail(parentId, newMedicine).catch(console.error);
+        return res.status(201).json(newMedicine);
+      } catch (err) {
+        console.warn('MongoDB query failed in addMedicine, using memory fallback:', err.message);
+      }
+    }
+
+    // In-memory fallback
+    let user = dbStore.findUserByClerkId(clerkId) || dbStore.upsertUser(clerkId, { role: 'Parent' });
     let parentId = user._id;
-    if (user.role === 'Mentee') {
-      if (!user.linkedParentId) return res.status(400).json({ message: 'Not linked to a parent' });
+    if (user.role === 'Mentee' || user.role === 'caretaker' || user.role === 'Caregiver') {
+      if (!user.linkedParentId) return res.status(400).json({ message: 'Not linked to a patient. Please enter patient invite code first.' });
       parentId = user.linkedParentId;
     }
 
-    const newMedicine = new Medicine({
+    const newMed = dbStore.createMedicine({
       ...req.body,
       createdBy: user._id,
       parentId
     });
-
-    await newMedicine.save();
-    
-    sendMedicineAddedEmail(parentId, newMedicine).catch(console.error);
-
-    res.status(201).json(newMedicine);
+    res.status(201).json(newMed);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -58,8 +101,18 @@ const addMedicine = async (req, res) => {
 // Update medicine
 const updateMedicine = async (req, res) => {
   try {
-    const medicine = await Medicine.findByIdAndUpdate(req.params.id, req.body, { new: true });
-    res.json(medicine);
+    if (isDbReady()) {
+      try {
+        const medicine = await Medicine.findByIdAndUpdate(req.params.id, req.body, { new: true });
+        if (medicine) return res.json(medicine);
+      } catch (err) {
+        console.warn('MongoDB query failed in updateMedicine, using memory fallback:', err.message);
+      }
+    }
+
+    const updated = dbStore.updateMedicine(req.params.id, req.body);
+    if (!updated) return res.status(404).json({ message: 'Medicine not found' });
+    res.json(updated);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -68,7 +121,16 @@ const updateMedicine = async (req, res) => {
 // Delete medicine
 const deleteMedicine = async (req, res) => {
   try {
-    await Medicine.findByIdAndDelete(req.params.id);
+    if (isDbReady()) {
+      try {
+        await Medicine.findByIdAndDelete(req.params.id);
+        return res.json({ message: 'Medicine deleted successfully' });
+      } catch (err) {
+        console.warn('MongoDB query failed in deleteMedicine, using memory fallback:', err.message);
+      }
+    }
+
+    dbStore.deleteMedicine(req.params.id);
     res.json({ message: 'Medicine deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: error.message });
@@ -79,15 +141,58 @@ const deleteMedicine = async (req, res) => {
 const markTaken = async (req, res) => {
   try {
     const { date, time } = req.body;
-    const medicine = await Medicine.findById(req.params.id);
-    if (!medicine) return res.status(404).json({ message: 'Medicine not found' });
-    
-    const alreadyTaken = medicine.takenLogs.some(log => log.date === date && log.time === time);
-    if (!alreadyTaken) {
-      medicine.takenLogs.push({ date, time });
-      await medicine.save();
+
+    if (isDbReady()) {
+      try {
+        const medicine = await Medicine.findById(req.params.id);
+        if (medicine) {
+          const alreadyTaken = medicine.takenLogs.some(log => log.date === date && log.time === time);
+          if (!alreadyTaken) {
+            medicine.takenLogs.push({ date, time });
+            await medicine.save();
+
+            // Record dose taken alert accurately in MongoDB
+            const takenNotif = {
+              userId: medicine.parentId,
+              message: `Dose confirmed taken: ${medicine.name} (${medicine.dosage || 'prescribed'}) scheduled for ${time}.`,
+              type: 'Info',
+              category: 'dose_taken',
+              priority: 'low',
+              medicineId: medicine._id,
+              medicineName: medicine.name,
+              dosage: medicine.dosage,
+              scheduledTime: time,
+              actionUrl: '/dashboard'
+            };
+            await Notification.create(takenNotif).catch(() => {});
+
+            // Auto-mark any missed dose alerts for this dose as resolved/read
+            await Notification.updateMany({
+              userId: medicine.parentId,
+              category: 'missed_dose',
+              medicineName: medicine.name,
+              scheduledTime: time
+            }, { readStatus: true }).catch(() => {});
+          }
+          return res.json(medicine);
+        }
+      } catch (err) {
+        console.warn('MongoDB query failed in markTaken, using memory fallback:', err.message);
+      }
     }
-    res.json(medicine);
+
+    const updated = dbStore.logTaken(req.params.id, date, time);
+    if (!updated) return res.status(404).json({ message: 'Medicine not found' });
+    dbStore.createNotification({
+      userId: updated.parentId,
+      message: `Dose confirmed taken: ${updated.name} scheduled for ${time}.`,
+      type: 'Info',
+      category: 'dose_taken',
+      priority: 'low',
+      medicineName: updated.name,
+      scheduledTime: time
+    });
+    res.json(updated);
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
@@ -97,15 +202,48 @@ const markTaken = async (req, res) => {
 const markTakenFromEmail = async (req, res) => {
   try {
     const { date, time } = req.query;
-    const medicine = await Medicine.findById(req.params.id);
-    if (!medicine) {
-      return res.send('<h2 style="font-family:Arial;text-align:center;padding:40px;color:red;">Medicine not found.</h2>');
-    }
-    
-    const alreadyTaken = medicine.takenLogs.some(log => log.date === date && log.time === time);
-    if (!alreadyTaken) {
-      medicine.takenLogs.push({ date, time });
-      await medicine.save();
+    let medicineName = 'Your medicine';
+
+    if (isDbReady()) {
+      try {
+        const medicine = await Medicine.findById(req.params.id);
+        if (medicine) {
+          medicineName = medicine.name;
+          const alreadyTaken = medicine.takenLogs.some(log => log.date === date && log.time === time);
+          if (!alreadyTaken) {
+            medicine.takenLogs.push({ date, time });
+            await medicine.save();
+
+            // Record dose taken alert accurately in MongoDB
+            const takenNotif = {
+              userId: medicine.parentId,
+              message: `Dose confirmed taken via Email: ${medicine.name} (${medicine.dosage || 'prescribed'}) scheduled for ${time}.`,
+              type: 'Info',
+              category: 'dose_taken',
+              priority: 'low',
+              medicineId: medicine._id,
+              medicineName: medicine.name,
+              dosage: medicine.dosage,
+              scheduledTime: time,
+              actionUrl: '/dashboard'
+            };
+            await Notification.create(takenNotif).catch(() => {});
+
+            // Auto-mark any missed dose alerts for this dose as resolved/read
+            await Notification.updateMany({
+              userId: medicine.parentId,
+              category: 'missed_dose',
+              medicineName: medicine.name,
+              scheduledTime: time
+            }, { readStatus: true }).catch(() => {});
+          }
+        }
+      } catch (err) {
+        console.warn('MongoDB markTakenFromEmail fallback:', err.message);
+      }
+    } else {
+      const med = dbStore.logTaken(req.params.id, date, time);
+      if (med) medicineName = med.name;
     }
     
     res.send(`<!DOCTYPE html>
@@ -192,7 +330,7 @@ const markTakenFromEmail = async (req, res) => {
     <div class="icon">&#10003;</div>
     <h1>Medicine Taken!</h1>
     <div class="te">మందు వేసుకున్నారు! &#128138;</div>
-    <div class="medicine-name">${medicine.name}</div>
+    <div class="medicine-name">${medicineName}</div>
     <p>&#10003; Successfully recorded. Stay healthy!</p>
     <p>&#10003; విజయవంతంగా నమోదు చేయబడింది. ఆరోగ్యంగా ఉండండి!</p>
     <div class="progress-bar"><div class="progress-fill"></div></div>
@@ -214,11 +352,78 @@ const markTakenFromEmail = async (req, res) => {
   }
 };
 
+// Check missed medicines manually or via API
+const checkMissed = async (req, res) => {
+  try {
+    const { checkMissedMedicines } = require('../services/cronService');
+    const missedHandled = await checkMissedMedicines();
+    res.json({
+      message: `Checked missed medicines. ${missedHandled.length} alert(s) dispatched.`,
+      missedDoses: missedHandled
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+};
+
+// Immediate missed dose alert when voice reminder finishes without user taking dose
+const sendMissedAlert = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { date, time } = req.body;
+    const today = date || new Date().toISOString().split('T')[0];
+
+    let medicine = null;
+    if (isDbReady()) {
+      try { medicine = await Medicine.findById(id); } catch (e) {}
+    }
+    if (!medicine) medicine = dbStore.findMedicineById(id);
+    if (!medicine) return res.status(404).json({ message: 'Medicine not found' });
+
+    const takenLogs = Array.isArray(medicine.takenLogs) ? medicine.takenLogs : [];
+    const isTaken = takenLogs.some(l => l.date === today && l.time === time);
+    if (isTaken) {
+      return res.json({ message: 'Medicine was already taken.' });
+    }
+
+    const missedLogs = Array.isArray(medicine.missedLogs) ? medicine.missedLogs : [];
+    const alreadyAlerted = missedLogs.some(l => l.date === today && l.time === time);
+    if (alreadyAlerted) {
+      return res.json({ message: 'Missed dose alert already sent.' });
+    }
+
+    // Save to missedLogs
+    if (isDbReady() && medicine.save) {
+      try {
+        if (!medicine.missedLogs) medicine.missedLogs = [];
+        medicine.missedLogs.push({ date: today, time });
+        await medicine.save();
+      } catch (e) {
+        dbStore.logMissed(medicine._id, today, time);
+      }
+    } else {
+      dbStore.logMissed(medicine._id, today, time);
+    }
+
+    // Send missed medicine email immediately to patient & caregiver
+    const { sendMissedMedicineEmail } = require('../services/emailService');
+    await sendMissedMedicineEmail(medicine.parentId, medicine, today, time);
+
+    console.log(`[Missed Alert] Sent immediate missed email for ${medicine.name} at ${time}`);
+    res.json({ message: 'Missed dose email sent successfully.' });
+  } catch (error) {
+    console.error('Error in sendMissedAlert:', error);
+    res.status(500).json({ message: error.message });
+  }
+};
+
 module.exports = {
   getMedicines,
   addMedicine,
   updateMedicine,
   deleteMedicine,
   markTaken,
-  markTakenFromEmail
+  markTakenFromEmail,
+  checkMissed,
+  sendMissedAlert
 };

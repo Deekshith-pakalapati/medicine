@@ -11,6 +11,7 @@ const medicineSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   parentId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   takenLogs: [{ date: String, time: String }], // To track adherence and stop alarm repeats
+  missedLogs: [{ date: String, time: String }], // To track missed dose alerts and avoid duplicate emails
   status: { type: String, enum: ['Active', 'Inactive'], default: 'Active' }
 }, { timestamps: true });
 

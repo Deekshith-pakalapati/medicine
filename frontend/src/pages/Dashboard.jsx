@@ -1,10 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { useAuth, UserButton } from '@clerk/clerk-react';
-import { Bell, Plus, Activity, LayoutDashboard, CalendarDays, AlertCircle, Loader2, Clock, CheckCircle2, FileText, Pill, X, RefreshCw, Trash2 } from 'lucide-react';
+import { Bell, Plus, Activity, LayoutDashboard, CalendarDays, AlertCircle, Loader2, Clock, CheckCircle2, FileText, Pill, X, RefreshCw, Trash2, Copy, Unlink, UserCheck } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { Link } from 'react-router-dom';
 import AddMedicineModal from '../components/AddMedicineModal';
 import ThemeToggle from '../components/ThemeToggle';
+import toast from 'react-hot-toast';
 
 const Dashboard = () => {
   const { getToken } = useAuth();
@@ -19,7 +20,9 @@ const Dashboard = () => {
   const [linkError, setLinkError] = useState('');
   const [isLinking, setIsLinking] = useState(false);
   const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isChangeLinkOpen, setIsChangeLinkOpen] = useState(false);
   const [deleteMessage, setDeleteMessage] = useState('');
+  const [unreadAlerts, setUnreadAlerts] = useState(0);
 
   const handleDeleteMedicine = async (id) => {
     try {
@@ -40,8 +43,8 @@ const Dashboard = () => {
   };
 
   const handleLink = async (e) => {
-    e.preventDefault();
-    if (!linkCode) return;
+    if (e) e.preventDefault();
+    if (!linkCode.trim()) return;
     setIsLinking(true);
     setLinkError('');
     try {
@@ -49,18 +52,59 @@ const Dashboard = () => {
       const res = await fetch(`${import.meta.env.VITE_API_URL}/users/link`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ inviteCode: linkCode.toUpperCase() })
+        body: JSON.stringify({ inviteCode: linkCode.trim().toUpperCase() })
       });
       if (res.ok) {
-        window.location.reload();
+        const data = await res.json();
+        toast.success(data.message || 'Linked successfully!', { icon: '🤝' });
+        setLinkCode('');
+        setIsChangeLinkOpen(false);
+        // Refresh profile
+        const userRes = await fetch(`${import.meta.env.VITE_API_URL}/users/profile`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+        if (userRes.ok) {
+          const u = await userRes.json();
+          setUser(u);
+        }
       } else {
-        setLinkError('Invalid code');
+        const data = await res.json().catch(() => ({}));
+        const errMsg = data.message || 'Invalid code';
+        setLinkError(errMsg);
+        toast.error(errMsg);
       }
     } catch (err) {
       setLinkError('Error linking account');
+      toast.error('Error linking account');
     } finally {
       setIsLinking(false);
     }
+  };
+
+  const handleUnlink = async () => {
+    if (!window.confirm('Are you sure you want to disconnect?')) return;
+    try {
+      const token = await getToken();
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/users/unlink`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      if (res.ok) {
+        toast.success('Disconnected successfully');
+        setUser(prev => ({ ...prev, linkedParentId: null }));
+        setIsChangeLinkOpen(false);
+      } else {
+        toast.error('Failed to disconnect');
+      }
+    } catch {
+      toast.error('Network error');
+    }
+  };
+
+  const handleCopyCode = (code) => {
+    if (!code) return;
+    navigator.clipboard.writeText(code);
+    toast.success(`Invite code copied: ${code}`, { icon: '📋' });
   };
 
   const handleRefreshCode = async () => {
@@ -73,10 +117,12 @@ const Dashboard = () => {
       });
       if (res.ok) {
         const updatedUser = await res.json();
-        setUser(updatedUser);
+        setUser(prev => ({ ...prev, inviteCode: updatedUser.inviteCode }));
+        toast.success(`New invite code generated: ${updatedUser.inviteCode}`);
       }
     } catch (err) {
       console.error('Failed to refresh code', err);
+      toast.error('Failed to refresh code');
     } finally {
       setIsRefreshing(false);
     }
@@ -86,30 +132,53 @@ const Dashboard = () => {
     const fetchData = async () => {
       try {
         const token = await getToken();
-        if (!token) { setError('Not authenticated'); setLoading(false); return; }
+        if (!token) { setLoading(false); return; }
 
-        const userRes = await fetch(`${import.meta.env.VITE_API_URL}/users/profile`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+        try {
+          const userRes = await fetch(`${import.meta.env.VITE_API_URL}/users/profile`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (userRes.ok) {
+            const userData = await userRes.json();
+            setUser(userData);
+          } else {
+            setUser({ name: 'Patient', role: 'Parent', inviteCode: 'PATIENT' });
+          }
+        } catch {
+          setUser({ name: 'Patient', role: 'Parent', inviteCode: 'PATIENT' });
+        }
 
-        if (!userRes.ok) throw new Error(`Server error ${userRes.status}`);
-        const userData = await userRes.json();
-        setUser(userData);
+        try {
+          const medRes = await fetch(`${import.meta.env.VITE_API_URL}/medicines`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (medRes.ok) {
+            const medData = await medRes.json();
+            setMedicines(Array.isArray(medData) ? medData : []);
+          }
+        } catch {
+          // ignore
+        }
 
-        const medRes = await fetch(`${import.meta.env.VITE_API_URL}/medicines`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-
-        if (medRes.ok) {
-          const medData = await medRes.json();
-          setMedicines(Array.isArray(medData) ? medData : []);
+        try {
+          const notifRes = await fetch(`${import.meta.env.VITE_API_URL}/notifications?unreadOnly=true`, {
+            headers: { Authorization: `Bearer ${token}` }
+          });
+          if (notifRes.ok) {
+            const notifData = await notifRes.json();
+            if (Array.isArray(notifData)) {
+              setUnreadAlerts(notifData.filter(n => !n.readStatus).length);
+            }
+          }
+        } catch {
+          // ignore
         }
 
         if ('Notification' in window && Notification.permission === 'default') {
           Notification.requestPermission();
         }
       } catch (err) {
-        setError(err.message || 'Failed to load data');
+        console.warn('Dashboard data fetch warning:', err);
       } finally {
         setLoading(false);
       }
@@ -178,10 +247,17 @@ const Dashboard = () => {
             <CalendarDays className="w-5 h-5" /> Schedule
           </Link>
           <Link to="/analytics" className="flex items-center gap-3 px-4 py-3 rounded-xl text-[#111]/60 dark:text-white/60 hover:bg-black/5 dark:hover:bg-white/5 font-medium transition-colors">
-            <Activity className="w-5 h-5" /> Analytics
+            <Activity className="w-5 h-5" /> Analytics & Notes
           </Link>
-          <Link to="/notifications" className="flex items-center gap-3 px-4 py-3 rounded-xl text-[#111]/60 dark:text-white/60 hover:bg-black/5 dark:hover:bg-white/5 font-medium transition-colors">
-            <Bell className="w-5 h-5" /> Alerts
+          <Link to="/notifications" className="flex items-center justify-between px-4 py-3 rounded-xl text-[#111]/60 dark:text-white/60 hover:bg-black/5 dark:hover:bg-white/5 font-medium transition-colors">
+            <div className="flex items-center gap-3">
+              <Bell className="w-5 h-5" /> Alerts
+            </div>
+            {unreadAlerts > 0 && (
+              <span className="bg-rose-500 text-white text-[10px] font-extrabold px-2 py-0.5 rounded-full shadow-sm animate-pulse">
+                {unreadAlerts}
+              </span>
+            )}
           </Link>
         </nav>
 
@@ -228,36 +304,55 @@ const Dashboard = () => {
               </button>
             </div>
             
-            <div className="flex flex-col md:flex-row items-stretch md:items-center gap-4 w-full md:w-auto">
+            <div className="flex flex-col md:flex-row items-stretch md:items-center gap-3 w-full xl:w-auto">
+              {/* Linked Status / Link Button */}
               {user?.linkedParentId ? (
-                <Link to="/mentee-dashboard" className="flex justify-center items-center gap-2 px-5 py-2.5 rounded-full text-sm font-bold border-2 border-indigo-500 text-indigo-500 hover:bg-indigo-500 hover:text-white transition-all glass-panel text-center">
-                  <Activity className="w-4 h-4" /> View Linked Dashboard
-                </Link>
-              ) : (
-                <form onSubmit={handleLink} className="flex items-center gap-2 w-full md:w-auto">
-                  <input 
-                    type="text" 
-                    placeholder="Link Patient Code..." 
-                    value={linkCode}
-                    onChange={(e) => setLinkCode(e.target.value)}
-                    className="flex-1 md:w-48 bg-black/5 dark:bg-white/5 border border-black/10 dark:border-white/10 px-4 py-2.5 rounded-full outline-none focus:border-indigo-500 text-sm font-medium uppercase text-[#111] dark:text-white placeholder:normal-case placeholder:text-xs"
-                    maxLength={6}
-                  />
-                  <button type="submit" disabled={isLinking} className="px-5 py-2.5 rounded-full text-sm font-bold border-2 border-indigo-500 text-indigo-500 hover:bg-indigo-500 hover:text-white transition-all shrink-0">
-                    {isLinking ? '...' : 'Link'}
+                <div className="flex items-center gap-2 px-3.5 py-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 text-xs sm:text-sm font-semibold text-emerald-600 dark:text-emerald-400">
+                  <UserCheck className="w-4 h-4 text-emerald-500" />
+                  <span className="font-bold truncate max-w-[140px]">
+                    {typeof user.linkedParentId === 'object' && user.linkedParentId?.name
+                      ? (String(user.linkedParentId?._id) === String(user?._id) ? 'Self-Linked' : user.linkedParentId.name)
+                      : (String(user?.linkedParentId) === String(user?._id) ? 'Self-Linked' : 'Linked')}
+                  </span>
+                  <button
+                    onClick={() => setIsChangeLinkOpen(!isChangeLinkOpen)}
+                    className="ml-1 text-[11px] underline opacity-80 hover:opacity-100 hover:text-indigo-500 transition-colors cursor-pointer"
+                  >
+                    {isChangeLinkOpen ? 'Close' : 'Change'}
                   </button>
-                </form>
+                  <Link
+                    to="/mentee-dashboard"
+                    className="ml-1.5 px-2.5 py-1 rounded-full bg-indigo-500 text-white text-[10px] font-extrabold uppercase hover:bg-indigo-600 transition-colors"
+                  >
+                    Caregiver Hub
+                  </Link>
+                </div>
+              ) : (
+                <button
+                  onClick={() => setIsChangeLinkOpen(!isChangeLinkOpen)}
+                  className="flex items-center gap-1.5 px-4 py-2.5 rounded-full border border-indigo-500/30 bg-indigo-500/10 text-xs sm:text-sm font-bold text-indigo-600 dark:text-indigo-400 hover:bg-indigo-500/20 transition-colors cursor-pointer"
+                >
+                  <Activity className="w-4 h-4" /> Link Account
+                </button>
               )}
 
+              {/* My Code with Copy & Refresh */}
               {user?.inviteCode && (
-                <div className="flex items-center gap-2 px-4 py-2 rounded-full border border-black/10 dark:border-white/10 text-sm font-medium glass-panel justify-center">
-                  <span className="text-[#111]/50 dark:text-white/50">My Code:</span>
+                <div className="flex items-center gap-2 px-3.5 py-2 rounded-full border border-black/10 dark:border-white/10 text-xs sm:text-sm font-medium glass-panel justify-center">
+                  <span className="text-[#111]/50 dark:text-white/50 text-xs">My Code:</span>
                   <span className="tracking-widest font-black text-[#111] dark:text-white">{user.inviteCode}</span>
+                  <button
+                    onClick={() => handleCopyCode(user.inviteCode)}
+                    title="Copy my invite code"
+                    className="p-1 hover:text-indigo-500 text-[#111]/40 dark:text-white/40 transition-colors cursor-pointer"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                  </button>
                   <button
                     onClick={handleRefreshCode}
                     disabled={isRefreshing}
-                    title="Generate new code"
-                    className="p-1 rounded-full hover:bg-black/10 dark:hover:bg-white/10 transition-colors text-[#111]/40 dark:text-white/40 hover:text-[#111] dark:hover:text-white"
+                    title="Generate new invite code"
+                    className="p-1 hover:text-indigo-500 text-[#111]/40 dark:text-white/40 transition-colors cursor-pointer"
                   >
                     <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
                   </button>
@@ -266,13 +361,72 @@ const Dashboard = () => {
               
               <button
                 onClick={() => setIsAddModalOpen(true)}
-                className="hidden md:flex items-center gap-2 px-6 py-3 rounded-full text-sm font-bold text-white bg-[#111] dark:bg-white dark:text-black hover:scale-105 transition-transform shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgba(255,255,255,0.12)] shrink-0"
+                className="hidden md:flex items-center gap-2 px-6 py-3 rounded-full text-sm font-bold text-white bg-[#111] dark:bg-white dark:text-black hover:scale-105 transition-transform shadow-[0_8px_30px_rgb(0,0,0,0.12)] dark:shadow-[0_8px_30px_rgba(255,255,255,0.12)] shrink-0 cursor-pointer"
               >
                 <Plus className="w-5 h-5" /> Add Medicine
               </button>
             </div>
           </motion.div>
         </header>
+
+        {/* Change / Enter Link Code Interactive Panel */}
+        <AnimatePresence>
+          {isChangeLinkOpen && (
+            <motion.div
+              initial={{ opacity: 0, height: 0, y: -10 }}
+              animate={{ opacity: 1, height: 'auto', y: 0 }}
+              exit={{ opacity: 0, height: 0, y: -10 }}
+              className="glass-card rounded-3xl p-6 mb-8 border border-indigo-500/30 bg-indigo-500/5 relative overflow-hidden"
+            >
+              <div className="flex flex-col md:flex-row items-start md:items-center justify-between gap-4 mb-4">
+                <div>
+                  <h3 className="text-lg font-bold text-[#111] dark:text-white flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-indigo-500" />
+                    {user?.linkedParentId ? 'Change or Switch Connected Account' : 'Connect to a Caregiver or Patient'}
+                  </h3>
+                  <p className="text-xs sm:text-sm text-[#111]/60 dark:text-white/60">
+                    Enter your partner's 6-character Invite Code (or your own code to self-link for dual access).
+                  </p>
+                </div>
+                <button
+                  onClick={() => setIsChangeLinkOpen(false)}
+                  className="p-1 rounded-full text-black/40 dark:text-white/40 hover:text-black dark:hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form onSubmit={handleLink} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                <input
+                  type="text"
+                  value={linkCode}
+                  onChange={(e) => setLinkCode(e.target.value.toUpperCase())}
+                  placeholder="CODE (e.g. A1B2C3)"
+                  className="flex-1 sm:max-w-xs bg-white dark:bg-[#111] px-4 py-2.5 rounded-xl text-center font-mono font-bold tracking-widest text-base border border-black/10 dark:border-white/10 focus:outline-none focus:border-indigo-500 text-black dark:text-white uppercase shadow-sm"
+                  maxLength={8}
+                />
+                <button
+                  type="submit"
+                  disabled={isLinking || !linkCode.trim()}
+                  className="px-6 py-2.5 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white font-bold text-sm shadow-md transition-all disabled:opacity-40 disabled:cursor-not-allowed flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  {isLinking ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Connect Account'}
+                </button>
+
+                {user?.linkedParentId && (
+                  <button
+                    type="button"
+                    onClick={handleUnlink}
+                    className="px-4 py-2.5 rounded-xl border border-rose-500/40 text-rose-500 hover:bg-rose-500/10 font-bold text-sm transition-colors flex items-center justify-center gap-2 cursor-pointer"
+                  >
+                    <Unlink className="w-4 h-4" /> Disconnect
+                  </button>
+                )}
+              </form>
+              {linkError && <p className="text-rose-500 text-xs font-bold mt-2">{linkError}</p>}
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Dashboard Grid Overview */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-12">
@@ -454,10 +608,16 @@ const Dashboard = () => {
           <CalendarDays className="w-6 h-6" /> Schedule
         </Link>
         <Link to="/analytics" className="flex flex-col items-center gap-1 text-[#111]/50 dark:text-white/50 hover:text-[#111] dark:hover:text-white font-bold text-[10px] uppercase tracking-wider transition-colors">
-          <Activity className="w-6 h-6" /> Analytics
+          <Activity className="w-6 h-6" /> Analytics & Notes
         </Link>
-        <Link to="/notifications" className="flex flex-col items-center gap-1 text-[#111]/50 dark:text-white/50 hover:text-[#111] dark:hover:text-white font-bold text-[10px] uppercase tracking-wider transition-colors">
-          <Bell className="w-6 h-6" /> Alerts
+        <Link to="/notifications" className="relative flex flex-col items-center gap-1 text-[#111]/50 dark:text-white/50 hover:text-[#111] dark:hover:text-white font-bold text-[10px] uppercase tracking-wider transition-colors">
+          <div className="relative">
+            <Bell className="w-6 h-6" />
+            {unreadAlerts > 0 && (
+              <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-rose-500 animate-pulse"></span>
+            )}
+          </div>
+          Alerts
         </Link>
       </nav>
 
